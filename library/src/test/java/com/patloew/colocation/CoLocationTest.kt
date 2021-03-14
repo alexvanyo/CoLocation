@@ -7,15 +7,22 @@ import com.google.android.gms.location.*
 import com.google.android.gms.tasks.*
 import io.mockk.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.test.*
 import org.junit.jupiter.api.AfterEach
-import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assertions.fail
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
+import java.lang.reflect.Field
+import java.lang.reflect.Modifier
 import java.util.concurrent.TimeUnit
 
 /* Copyright 2020 Patrick Löwenstein
@@ -38,13 +45,21 @@ class CoLocationTest {
     private val settings: SettingsClient = mockk()
     private val context: Context = mockk()
     private val testCoroutineDispatcher = TestCoroutineDispatcher()
-    private val testCoroutineScope = TestCoroutineScope()
+    private val testCoroutineScope = TestCoroutineScope(testCoroutineDispatcher)
 
     private val coLocation = CoLocationImpl(context)
 
     @BeforeEach
     fun before() {
         Dispatchers.setMain(testCoroutineDispatcher)
+
+        val field = TaskExecutors::class.java.getDeclaredField("MAIN_THREAD")
+        field.isAccessible = true
+        val modifierFields = Field::class.java.getDeclaredField("modifiers")
+        modifierFields.isAccessible = true
+        modifierFields.setInt(field, field.modifiers and Modifier.FINAL.inv())
+        field.set(null, Dispatchers.Main.asExecutor())
+
         mockkStatic(LocationServices::class)
         every { LocationServices.getFusedLocationProviderClient(context) } returns locationProvider
         every { LocationServices.getSettingsClient(context) } returns settings
@@ -59,7 +74,7 @@ class CoLocationTest {
     }
 
     @Test
-    fun flushLocations() {
+    fun flushLocations() = testCoroutineScope.runBlockingTest {
         testTaskWithCancelThrows(
             createTask = { locationProvider.flushLocations() },
             taskResult = null,
@@ -71,7 +86,7 @@ class CoLocationTest {
 
     @ParameterizedTest
     @ValueSource(booleans = [false, true])
-    fun isLocationAvailable(locationAvailable: Boolean) {
+    fun isLocationAvailable(locationAvailable: Boolean) = testCoroutineScope.runBlockingTest {
         val locationAvailability = mockk<LocationAvailability> {
             every { isLocationAvailable } returns locationAvailable
         }
@@ -93,14 +108,13 @@ class CoLocationTest {
             LocationRequest.PRIORITY_NO_POWER
         ]
     )
-    fun getCurrentLocation(priority: Int) {
+    fun getCurrentLocation(priority: Int) = testCoroutineScope.runBlockingTest {
         val location = mockk<Location>()
-        testTaskWithCancelReturns(
+        testTaskWithCancelThrows(
             createTask = { locationProvider.getCurrentLocation(priority, any()) },
             taskResult = location,
             expectedResult = location,
             expectedErrorException = TestException(),
-            cancelResult = null,
             coLocationCall = { coLocation.getCurrentLocation(priority) }
         )
     }
@@ -115,24 +129,27 @@ class CoLocationTest {
         ]
     )
     fun `cancelling getCurrentLocation cancels task`(priority: Int) {
-        val tokenSlot = slot<CancellationToken>()
+        lateinit var currentLocationTaskCompletionSource: TaskCompletionSource<Location>
 
         every {
-            locationProvider.getCurrentLocation(priority, capture(tokenSlot))
-        } returns mockk(relaxed = true)
+            locationProvider.getCurrentLocation(priority, any())
+        } answers {
+            currentLocationTaskCompletionSource = TaskCompletionSource(arg(1))
+            currentLocationTaskCompletionSource.task
+        }
 
-        val deferred = testCoroutineScope.async(start = CoroutineStart.UNDISPATCHED) {
+        val deferred = testCoroutineScope.async {
             coLocation.getCurrentLocation(priority)
         }
 
         deferred.cancel()
 
         assertTrue(deferred.isCancelled)
-        assertTrue(tokenSlot.captured.isCancellationRequested)
+        assertTrue(currentLocationTaskCompletionSource.task.isCanceled)
     }
 
     @Test
-    fun getLastLocation() {
+    fun getLastLocation() = testCoroutineScope.runBlockingTest {
         val location = mockk<Location>()
         testTaskWithCancelThrows(
             createTask = { locationProvider.lastLocation },
@@ -144,7 +161,7 @@ class CoLocationTest {
     }
 
     @Test
-    fun setMockLocation() {
+    fun setMockLocation() = testCoroutineScope.runBlockingTest {
         val location: Location = mockk()
         testTaskWithCancelThrows(
             createTask = { locationProvider.setMockLocation(location) },
@@ -157,7 +174,7 @@ class CoLocationTest {
 
     @ParameterizedTest
     @ValueSource(booleans = [false, true])
-    fun setMockMode(mockMode: Boolean) {
+    fun setMockMode(mockMode: Boolean) = testCoroutineScope.runBlockingTest {
         testTaskWithCancelThrows(
             createTask = { locationProvider.setMockMode(mockMode) },
             taskResult = null,
@@ -169,8 +186,9 @@ class CoLocationTest {
 
     @Test
     fun `getLocationUpdate success`() {
-        val requestTask: Task<Void> = mockk(relaxed = true)
-        val removeTask: Task<Void> = mockk(relaxed = true)
+        val requestTaskCompletionSource = TaskCompletionSource<Void>()
+        val removeTaskCompletionSource = TaskCompletionSource<Void>()
+
         val locationRequest: LocationRequest = mockk {
             every { numUpdates } returns Integer.MAX_VALUE
         }
@@ -182,14 +200,20 @@ class CoLocationTest {
                 capture(callbackSlot),
                 any()
             )
-        } returns requestTask
+        } answers {
+            every {
+                locationProvider.removeLocationUpdates(callbackSlot.captured)
+            } returns removeTaskCompletionSource.task
+
+            requestTaskCompletionSource.task
+        }
         var result: Location? = null
 
-        val job = testCoroutineScope.launch { result = coLocation.getLocationUpdate(locationRequest) }
+        val job = testCoroutineScope.launch {
+            result = coLocation.getLocationUpdate(locationRequest)
+        }
 
-        runBlocking {
-            callbackSlot.waitForCapture()
-            every { locationProvider.removeLocationUpdates(callbackSlot.captured) } returns removeTask
+        testCoroutineScope.runBlockingTest {
             locations.forEach { location ->
                 callbackSlot.captured.onLocationResult(LocationResult.create(listOf(location)))
                 delay(10)
@@ -203,11 +227,25 @@ class CoLocationTest {
 
     @Test
     fun `getLocationUpdate error`() {
-        val requestTask: Task<Void> = mockk(relaxed = true)
+        val requestTaskCompletionSource = TaskCompletionSource<Void>()
+        val removeTaskCompletionSource = TaskCompletionSource<Void>()
+
         val testException = TestException()
-        requestTask.mockError(testException)
+        requestTaskCompletionSource.setException(testException)
         val locationRequest: LocationRequest = mockk()
-        every { locationProvider.requestLocationUpdates(locationRequest, any(), any()) } returns requestTask
+
+        val callbackSlot = slot<LocationCallback>()
+
+        every {
+            locationProvider.requestLocationUpdates(locationRequest, capture(callbackSlot), any())
+        } answers {
+            every {
+                locationProvider.removeLocationUpdates(callbackSlot.captured)
+            } returns removeTaskCompletionSource.task
+
+            requestTaskCompletionSource.task
+        }
+
         var result: Location? = null
         var resultException: TestException? = null
 
@@ -225,17 +263,32 @@ class CoLocationTest {
 
     @Test
     fun `getLocationUpdate cancel`() {
-        val requestTask: Task<Void> = mockk(relaxed = true)
-        requestTask.mockCanceled()
+        val cancellationTokenSource = CancellationTokenSource()
+
+        val requestTaskCompletionSource = TaskCompletionSource<Void>(cancellationTokenSource.token)
+        val removeTaskCompletionSource = TaskCompletionSource<Void>()
+
+        cancellationTokenSource.cancel()
         val locationRequest: LocationRequest = mockk()
-        every { locationProvider.requestLocationUpdates(locationRequest, any(), any()) } returns requestTask
+
+        val callbackSlot = slot<LocationCallback>()
+
+        every {
+            locationProvider.requestLocationUpdates(locationRequest, capture(callbackSlot), any())
+        } answers {
+            every {
+                locationProvider.removeLocationUpdates(callbackSlot.captured)
+            } returns removeTaskCompletionSource.task
+
+            requestTaskCompletionSource.task
+        }
         var result: Location? = null
-        var resultException: TaskCancelledException? = null
+        var resultException: CancellationException? = null
 
         testCoroutineScope.runBlockingTest {
             try {
                 result = coLocation.getLocationUpdate(locationRequest)
-            } catch (e: TaskCancelledException) {
+            } catch (e: CancellationException) {
                 resultException = e
             }
         }
@@ -246,8 +299,9 @@ class CoLocationTest {
 
     @Test
     fun `getLocationUpdates success`() {
-        val requestTask: Task<Void> = mockk(relaxed = true)
-        val removeTask: Task<Void> = mockk(relaxed = true)
+        val requestTaskCompletionSource = TaskCompletionSource<Void>()
+        val removeTaskCompletionSource = TaskCompletionSource<Void>()
+
         val locationRequest: LocationRequest = mockk {
             every { numUpdates } returns Integer.MAX_VALUE
         }
@@ -259,15 +313,21 @@ class CoLocationTest {
                 capture(callbackSlot),
                 any()
             )
-        } returns requestTask
+        } answers {
+            every {
+                locationProvider.removeLocationUpdates(callbackSlot.captured)
+            } returns removeTaskCompletionSource.task
+
+            requestTaskCompletionSource.task
+        }
 
         val flowResults = mutableListOf<Location>()
 
-        val job = testCoroutineScope.launch { coLocation.getLocationUpdates(locationRequest).collect(flowResults::add) }
+        val job = testCoroutineScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            coLocation.getLocationUpdates(locationRequest).collect(flowResults::add)
+        }
 
-        runBlocking {
-            callbackSlot.waitForCapture()
-            every { locationProvider.removeLocationUpdates(callbackSlot.captured) } returns removeTask
+        testCoroutineScope.runBlockingTest {
             locations.forEach { location ->
                 callbackSlot.captured.onLocationResult(LocationResult.create(listOf(location)))
                 delay(10)
@@ -281,48 +341,53 @@ class CoLocationTest {
 
     @Test
     fun `getLocationUpdates error`() {
-        val requestTask: Task<Void> = mockk(relaxed = true)
+        val requestTaskCompletionSource = TaskCompletionSource<Void>()
         val testException = TestException()
-        requestTask.mockError(testException)
+        requestTaskCompletionSource.setException(testException)
         val locationRequest: LocationRequest = mockk()
-        every { locationProvider.requestLocationUpdates(locationRequest, any(), any()) } returns requestTask
+        every {
+            locationProvider.requestLocationUpdates(locationRequest, any(), any())
+        } returns requestTaskCompletionSource.task
         every { locationProvider.removeLocationUpdates(any<LocationCallback>()) } returns mockk()
-        var resultException: CancellationException? = null
 
         testCoroutineScope.runBlockingTest {
-            try {
+            assertThrows<TestException> {
                 coLocation.getLocationUpdates(locationRequest).collect()
-            } catch (e: CancellationException) {
-                resultException = e
             }
         }
-
-        assertNotNull(resultException)
-        assertEquals(testException, resultException!!.cause!!.cause)
     }
 
     @Test
     fun `getLocationUpdates cancel`() {
-        val requestTask: Task<Void> = mockk(relaxed = true)
-        requestTask.mockCanceled()
-        val locationRequest: LocationRequest = mockk()
-        every { locationProvider.requestLocationUpdates(locationRequest, any(), any()) } returns requestTask
-        every { locationProvider.removeLocationUpdates(any<LocationCallback>()) } returns mockk()
-        var resultException: CancellationException? = null
+        val cancellationTokenSource = CancellationTokenSource()
 
-        testCoroutineScope.runBlockingTest {
+        val requestTaskCompletionSource = TaskCompletionSource<Void>(cancellationTokenSource.token)
+        val locationRequest: LocationRequest = mockk()
+        every {
+            locationProvider.requestLocationUpdates(locationRequest, any(), any())
+        } returns requestTaskCompletionSource.task
+        every { locationProvider.removeLocationUpdates(any<LocationCallback>()) } returns mockk()
+
+        val deferred = testCoroutineScope.async {
             try {
                 coLocation.getLocationUpdates(locationRequest).collect()
+                null
             } catch (e: CancellationException) {
-                resultException = e
+                e
             }
         }
 
-        assertTrue(resultException!!.cause!!.cause is TaskCancelledException)
+        cancellationTokenSource.cancel()
+
+        testCoroutineScope.runBlockingTest {
+            val resultException = deferred.await()
+
+            assertNotNull(resultException)
+        }
     }
 
     @Test
-    fun `checkLocationSettings satisfied`() {
+    fun `checkLocationSettings satisfied`() = testCoroutineScope.runBlockingTest {
         val locationSettingsRequest: LocationSettingsRequest = mockk()
         testTaskSuccess(
             createTask = { settings.checkLocationSettings(locationSettingsRequest) },
@@ -335,27 +400,37 @@ class CoLocationTest {
     @Test
     fun `checkLocationSettings resolvable`() {
         val locationSettingsRequest: LocationSettingsRequest = mockk()
-        val errorTask = mockTask<LocationSettingsResponse>()
-        every { settings.checkLocationSettings(locationSettingsRequest) } returns errorTask
-        errorTask.mockError(mockk<ResolvableApiException>())
-        val result = runBlocking { coLocation.checkLocationSettings(locationSettingsRequest) }
-        assertTrue(result is CoLocation.SettingsResult.Resolvable)
+        val errorTaskCompletionSource = TaskCompletionSource<LocationSettingsResponse>()
+        errorTaskCompletionSource.setException(mockk<ResolvableApiException>())
+
+        every {
+            settings.checkLocationSettings(locationSettingsRequest)
+        } returns errorTaskCompletionSource.task
+        testCoroutineScope.runBlockingTest {
+            val result = coLocation.checkLocationSettings(locationSettingsRequest)
+            assertTrue(result is CoLocation.SettingsResult.Resolvable)
+        }
     }
 
     @Test
     fun `checkLocationSettings not resolvable`() {
         val locationSettingsRequest: LocationSettingsRequest = mockk()
-        val errorTask = mockTask<LocationSettingsResponse>()
-        every { settings.checkLocationSettings(locationSettingsRequest) } returns errorTask
-        errorTask.mockError(TestException())
-        val result = runBlocking { coLocation.checkLocationSettings(locationSettingsRequest) }
-        assertTrue(result is CoLocation.SettingsResult.NotResolvable)
+        val errorTaskCompletionSource = TaskCompletionSource<LocationSettingsResponse>()
+        errorTaskCompletionSource.setException(TestException())
+
+        every {
+            settings.checkLocationSettings(locationSettingsRequest)
+        } returns errorTaskCompletionSource.task
+        testCoroutineScope.runBlockingTest {
+            val result = coLocation.checkLocationSettings(locationSettingsRequest)
+            assertTrue(result is CoLocation.SettingsResult.NotResolvable)
+        }
     }
 
     @Test
-    fun `checkLocationSettings canceled`() {
+    fun `checkLocationSettings canceled`() = testCoroutineScope.runBlockingTest {
         val locationSettingsRequest: LocationSettingsRequest = mockk()
-        assertThrows(TaskCancelledException::class.java) {
+        assertThrows<CancellationException> {
             testTaskCancel(
                 createTask = { settings.checkLocationSettings(locationSettingsRequest) },
                 coLocationCall = { coLocation.checkLocationSettings(locationSettingsRequest) }
@@ -364,7 +439,7 @@ class CoLocationTest {
     }
 
     @Test
-    fun `checkLocationSettings locationRequest success`() {
+    fun `checkLocationSettings locationRequest success`() = testCoroutineScope.runBlockingTest {
         val locationRequest: LocationRequest = mockk()
         testTaskSuccess(
             createTask = { settings.checkLocationSettings(any()) },
@@ -373,131 +448,72 @@ class CoLocationTest {
             coLocationCall = { coLocation.checkLocationSettings(locationRequest) }
         )
     }
-
-    private fun <T, R> testTaskWithCancelThrows(
-        createTask: MockKMatcherScope.() -> Task<T>,
-        taskResult: T,
-        expectedResult: R,
-        expectedErrorException: Exception,
-        coLocationCall: suspend CoroutineScope.() -> R
-    ) {
-        testTaskSuccess(createTask, taskResult, expectedResult, coLocationCall)
-        testTaskFailure(createTask, expectedErrorException, coLocationCall)
-        assertThrows(CancellationException::class.java) { testTaskCancel(createTask, coLocationCall) }
-    }
-
-    private fun <T, R> testTaskWithCancelReturns(
-        createTask: MockKMatcherScope.() -> Task<T>,
-        taskResult: T,
-        expectedResult: R?,
-        expectedErrorException: Exception,
-        cancelResult: R?,
-        coLocationCall: suspend CoroutineScope.() -> R
-    ) {
-        testTaskSuccess(createTask, taskResult, expectedResult, coLocationCall)
-        testTaskFailure(createTask, expectedErrorException, coLocationCall)
-        assertEquals(cancelResult, testTaskCancel(createTask, coLocationCall))
-    }
-
-    private fun <T, R> testTaskCancel(
-        createTask: MockKMatcherScope.() -> Task<T>,
-        coLocationCall: suspend CoroutineScope.() -> R
-    ): R? {
-        val cancelTask = mockTask<T>()
-        every { createTask() } returns cancelTask
-
-        cancelTask.mockCanceled()
-
-        return runBlocking { coLocationCall() }
-    }
-
-    private fun <T, R> testTaskSuccess(
-        createTask: MockKMatcherScope.() -> Task<T>,
-        taskResult: T,
-        expectedResult: R,
-        coLocationCall: suspend CoroutineScope.() -> R
-    ) {
-        val successTask = mockTask<T>()
-        every { createTask() } returns successTask
-
-        successTask.mockSuccess(taskResult)
-
-        assertEquals(expectedResult, runBlocking { coLocationCall() })
-    }
-
-    private fun <T, R> testTaskFailure(
-        createTask: MockKMatcherScope.() -> Task<T>,
-        expectedErrorException: Exception,
-        coLocationCall: suspend CoroutineScope.() -> R
-    ) {
-        val errorTask = mockTask<T>()
-        every { createTask() } returns errorTask
-
-        assertThrows(expectedErrorException::class.java) {
-            errorTask.mockError(expectedErrorException)
-            runBlocking { coLocationCall() }
-        }
-
-    }
-
-
-    private fun <T> Task<T>.mockSuccess(taskResult: T) {
-        every { isComplete } returns false
-        every { isCanceled } returns false
-        every { exception } returns null
-        every { result } returns taskResult
-        every { addOnCompleteListener(any()) } answers {
-            val task = self as Task<T>
-            firstArg<OnCompleteListener<T>>().onComplete(task)
-            task
-        }
-        every { addOnSuccessListener(any()) } answers {
-            firstArg<OnSuccessListener<T>>().onSuccess(taskResult)
-            self as Task<T>
-        }
-    }
-
-
-    private fun <E : Exception, T> Task<T>.mockError(e: E) {
-        every { isComplete } returns false
-        every { exception } returns e
-        every { addOnCompleteListener(any()) } answers {
-            val task = self as Task<T>
-            firstArg<OnCompleteListener<T>>().onComplete(task)
-            task
-        }
-        every { addOnFailureListener(any()) } answers {
-            firstArg<OnFailureListener>().onFailure(e)
-            self as Task<T>
-        }
-    }
-
-    private fun <T> Task<T>.mockCanceled() {
-        every { isComplete } returns false
-        every { isCanceled } returns true
-        every { exception } returns null
-        every { addOnCompleteListener(any()) } answers {
-            val task = self as Task<T>
-            firstArg<OnCompleteListener<T>>().onComplete(task)
-            task
-        }
-        every { addOnCanceledListener(any()) } answers {
-            firstArg<OnCanceledListener>().onCanceled()
-            self as Task<T>
-        }
-    }
-
-    private fun <T> mockTask() = mockk<Task<T>>().apply {
-        every { addOnSuccessListener(any()) } returns this
-        every { addOnCanceledListener(any()) } returns this
-        every { addOnFailureListener(any()) } returns this
-    }
-
-    private suspend fun CapturingSlot<*>.waitForCapture() {
-        while (!isCaptured) {
-            delay(1)
-        }
-    }
-
-    class TestException : Exception()
 }
+
+private suspend fun <T, R> testTaskWithCancelThrows(
+    createTask: MockKMatcherScope.() -> Task<T>,
+    taskResult: T,
+    expectedResult: R,
+    expectedErrorException: Exception,
+    coLocationCall: suspend () -> R
+) {
+    testTaskSuccess(createTask, taskResult, expectedResult, coLocationCall)
+    testTaskFailure(createTask, expectedErrorException, coLocationCall)
+    assertThrows<CancellationException> { testTaskCancel(createTask, coLocationCall) }
+}
+
+private suspend fun <T, R> testTaskCancel(
+    createTask: MockKMatcherScope.() -> Task<T>,
+    coLocationCall: suspend () -> R
+): R? {
+    val cancellationTokenSource = CancellationTokenSource()
+    val cancelTaskCompletionSource = TaskCompletionSource<T>(cancellationTokenSource.token)
+    every { createTask() } returns cancelTaskCompletionSource.task
+
+    cancellationTokenSource.cancel()
+
+    return coLocationCall()
+}
+
+private suspend fun <T, R> testTaskSuccess(
+    createTask: MockKMatcherScope.() -> Task<T>,
+    taskResult: T,
+    expectedResult: R,
+    coLocationCall: suspend () -> R
+) {
+    val successTaskCompletionSource = TaskCompletionSource<T>()
+    every { createTask() } returns successTaskCompletionSource.task
+
+    successTaskCompletionSource.setResult(taskResult)
+
+    assertEquals(expectedResult, coLocationCall())
+}
+
+private suspend fun <T, R> testTaskFailure(
+    createTask: MockKMatcherScope.() -> Task<T>,
+    expectedErrorException: Exception,
+    coLocationCall: suspend () -> R
+) {
+    val errorTaskCompletionSource = TaskCompletionSource<T>()
+    every { createTask() } returns errorTaskCompletionSource.task
+
+    errorTaskCompletionSource.setException(expectedErrorException)
+
+    assertThrows(expectedErrorException::class.java) {
+        coLocationCall()
+    }
+}
+
+class TestException : Exception()
+
+private inline fun <T : Throwable, R> assertThrows(clazz: Class<T>, block: () -> R) {
+    try {
+        block()
+        fail("block did not throw expected exception")
+    } catch (throwable: Throwable) {
+        assertEquals(clazz, throwable::class.java)
+    }
+}
+
+private inline fun <reified T : Throwable> assertThrows(block: () -> Any?) =
+    assertThrows(T::class.java, block)
