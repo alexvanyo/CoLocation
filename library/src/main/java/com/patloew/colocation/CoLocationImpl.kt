@@ -8,17 +8,19 @@ import androidx.annotation.RequiresPermission
 import com.google.android.gms.common.api.ResolvableApiException
 import com.google.android.gms.location.*
 import com.google.android.gms.tasks.CancellationTokenSource
-import com.google.android.gms.tasks.Task
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedSendChannelException
+import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.channels.sendBlocking
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.tasks.await
 
 /* Copyright 2020 Patrick Löwenstein
  *
@@ -40,61 +42,33 @@ internal class CoLocationImpl(private val context: Context) : CoLocation {
     }
     private val settings: SettingsClient by lazy { LocationServices.getSettingsClient(context) }
 
-    private val cancelledMessage = "Task was cancelled"
-
-    override suspend fun flushLocations() = locationProvider.flushLocations().asCoroutine()
+    override suspend fun flushLocations() {
+        locationProvider.flushLocations().await()
+    }
 
     @RequiresPermission(anyOf = [Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION])
     override suspend fun isLocationAvailable(): Boolean =
-        locationProvider.locationAvailability.asCoroutine { it.isLocationAvailable }
+        locationProvider.locationAvailability.await().isLocationAvailable
 
     @RequiresPermission(anyOf = [Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION])
-    override suspend fun getCurrentLocation(priority: Int): Location? =
-        suspendCancellableCoroutine { cont ->
-            val cancellationTokenSource = CancellationTokenSource()
+    override suspend fun getCurrentLocation(priority: Int): Location? {
+        val cancellationTokenSource = CancellationTokenSource()
 
-            locationProvider.getCurrentLocation(priority, cancellationTokenSource.token).apply {
-                addOnSuccessListener { cont.resume(it) }
-                addOnCanceledListener { cont.resume(null) }
-                addOnFailureListener { cont.resumeWithException(it) }
-            }
-
-            cont.invokeOnCancellation { cancellationTokenSource.cancel() }
+        return try {
+            locationProvider.getCurrentLocation(priority, cancellationTokenSource.token).await()
+        } catch (cancellationException: CancellationException) {
+            cancellationTokenSource.cancel()
+            throw cancellationException
         }
+    }
 
     @RequiresPermission(anyOf = [Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION])
-    override suspend fun getLastLocation(): Location? =
-        suspendCancellableCoroutine { cont ->
-            locationProvider.lastLocation.apply {
-                addOnSuccessListener { cont.resume(it) }
-                addOnCanceledListener { cont.resume(null) }
-                addOnFailureListener { cont.resumeWithException(it) }
-            }
-        }
+    override suspend fun getLastLocation(): Location? = locationProvider.lastLocation.await()
 
+    @ExperimentalCoroutinesApi
     @RequiresPermission(anyOf = [Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION])
     override suspend fun getLocationUpdate(locationRequest: LocationRequest): Location =
-        suspendCancellableCoroutine { cont ->
-            lateinit var callback: ClearableLocationCallback
-            callback = object : LocationCallback() {
-                override fun onLocationResult(result: LocationResult) {
-                    cont.resume(result.lastLocation)
-                    locationProvider.removeLocationUpdates(callback)
-                    callback.clear()
-                }
-            }.let(::ClearableLocationCallback) // Needed since we would have memory leaks otherwise
-
-            locationProvider.requestLocationUpdates(locationRequest, callback, Looper.getMainLooper()).apply {
-                addOnCanceledListener {
-                    callback.clear()
-                    cont.resumeWithException(TaskCancelledException(cancelledMessage))
-                }
-                addOnFailureListener {
-                    callback.clear()
-                    cont.resumeWithException(it)
-                }
-            }
-        }
+        getLocationUpdates(locationRequest, Channel.CONFLATED).first()
 
     @ExperimentalCoroutinesApi
     @RequiresPermission(anyOf = [Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION])
@@ -103,14 +77,21 @@ internal class CoLocationImpl(private val context: Context) : CoLocation {
             val callback = object : LocationCallback() {
                 private var counter: Int = 0
                 override fun onLocationResult(result: LocationResult) {
-                    result.lastLocation?.also { location -> sendBlocking(location) }
+                    result.lastLocation?.also { location -> sendBlockingOrNull(location) }
                     if (locationRequest.numUpdates == ++counter) close()
                 }
             }.let(::ClearableLocationCallback) // Needed since we would have memory leaks otherwise
 
-            locationProvider.requestLocationUpdates(locationRequest, callback, Looper.getMainLooper()).apply {
-                addOnCanceledListener { cancel(cancelledMessage, TaskCancelledException(cancelledMessage)) }
-                addOnFailureListener { cancel("Error requesting location updates", it) }
+            try {
+                locationProvider.requestLocationUpdates(
+                    locationRequest,
+                    callback,
+                    Looper.getMainLooper()
+                ).await()
+            } catch (cancellationException: CancellationException) {
+                cancel(cancellationException)
+            } catch (throwable: Throwable) {
+                close(throwable)
             }
 
             awaitClose {
@@ -120,36 +101,29 @@ internal class CoLocationImpl(private val context: Context) : CoLocation {
         }.buffer(capacity)
 
     override suspend fun checkLocationSettings(locationSettingsRequest: LocationSettingsRequest): CoLocation.SettingsResult =
-        suspendCancellableCoroutine { cont ->
-            settings.checkLocationSettings(locationSettingsRequest)
-                .addOnSuccessListener { cont.resume(CoLocation.SettingsResult.Satisfied) }
-                .addOnCanceledListener { cont.resumeWithException(TaskCancelledException(cancelledMessage)) }
-                .addOnFailureListener { exception ->
-                    if (exception is ResolvableApiException) {
-                        CoLocation.SettingsResult.Resolvable(exception)
-                    } else {
-                        CoLocation.SettingsResult.NotResolvable(exception)
-                    }.run(cont::resume)
-                }
+        try {
+            settings.checkLocationSettings(locationSettingsRequest).await()
+            CoLocation.SettingsResult.Satisfied
+        } catch (cancellationException: CancellationException) {
+            throw cancellationException
+        } catch (resolvableApiException: ResolvableApiException) {
+            CoLocation.SettingsResult.Resolvable(resolvableApiException)
+        } catch (exception: Exception) {
+            CoLocation.SettingsResult.NotResolvable(exception)
         }
 
     override suspend fun checkLocationSettings(locationRequest: LocationRequest): CoLocation.SettingsResult =
         checkLocationSettings(LocationSettingsRequest.Builder().addLocationRequest(locationRequest).build())
 
     @RequiresPermission(anyOf = [Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION])
-    override suspend fun setMockLocation(location: Location) = locationProvider.setMockLocation(location).asCoroutine()
+    override suspend fun setMockLocation(location: Location) {
+        locationProvider.setMockLocation(location).await()
+    }
 
     @RequiresPermission(anyOf = [Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION])
-    override suspend fun setMockMode(isMockMode: Boolean) = locationProvider.setMockMode(isMockMode).asCoroutine()
-
-    private suspend inline fun <T, R> Task<T>.asCoroutine(crossinline transformResult: (T) -> R): R =
-        suspendCancellableCoroutine { cont ->
-            addOnSuccessListener { cont.resume(transformResult(it)) }
-            addOnCanceledListener { cont.resumeWithException(TaskCancelledException(cancelledMessage)) }
-            addOnFailureListener { cont.resumeWithException(it) }
-        }
-
-    private suspend inline fun Task<Void>.asCoroutine() = asCoroutine { Unit }
+    override suspend fun setMockMode(isMockMode: Boolean) {
+        locationProvider.setMockMode(isMockMode).await()
+    }
 
 }
 
@@ -170,4 +144,15 @@ private class ClearableLocationCallback(callback: LocationCallback) : LocationCa
         callback = null
     }
 
+}
+
+/**
+ * Since offer() can throw when the channel is closed (channel can close before the
+ * block within awaitClose), wrap `sendBlocking` calls.
+ * See: https://github.com/Kotlin/kotlinx.coroutines/issues/974
+ */
+private fun <E> SendChannel<E>.sendBlockingOrNull(element: E) = try {
+    sendBlocking(element)
+} catch (e: ClosedSendChannelException) {
+    null
 }
